@@ -1,0 +1,11 @@
+__pycache__/
+.states
+*.db
+assets/external/
+.web
+*.py[cod]
+venv/
+pyvenv.cfg
+
+# Reflex-generated frontend toolchain lock (regenerated on `reflex run`)
+reflex.lock/
