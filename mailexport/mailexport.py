@@ -10,23 +10,13 @@ Then open http://localhost:3000 in your browser.
 from __future__ import annotations
 
 import asyncio
-import email as email_lib
-import mailbox as mailbox_lib
-import zipfile
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import reflex as rx
 
-from .imap_utils import (
-    META_FLAGS,
-    META_FOLDER,
-    connect_imap,
-    count_messages_in_folder,
-    fetch_messages_with_flags,
-    list_folders,
-)
+from .core import iter_export
+from .imap_utils import connect_imap, list_folders
 from .mailimport import import_page
 from .ui_common import PROVIDERS, USERNAME_HINTS, card, feedback_box, field
 
@@ -229,84 +219,28 @@ class State(rx.State):
         yield
 
         try:
-            out_path = Path(self.out_dir)
-            out_path.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            conn = connect_imap(
-                self.host.strip(),
-                int(self.port or "993"),
-                self.username.strip(),
-                self.password,
-                self.ssl,
-            )
-
-            self.info_msg = "Counting messages across selected folders…"
-            yield
-            total = 0
-            for folder in selected:
-                total += count_messages_in_folder(conn, folder)
-            self.total = total
-            yield
-
-            count = 0
-
-            if self.export_fmt == "mbox":
-                file_path = out_path / f"mailbox_{ts}.mbox"
-                mbox = mailbox_lib.mbox(str(file_path))
-
-                for folder in selected:
-                    self.info_msg = f"Exporting folder: {folder}"
+            i = 0
+            for p in iter_export(
+                host=self.host.strip(),
+                port=self.port,
+                username=self.username.strip(),
+                password=self.password,
+                ssl=self.ssl,
+                out_dir=self.out_dir,
+                export_fmt=self.export_fmt,
+                folders=selected,
+            ):
+                self.progress = p.done
+                self.total = p.total
+                if p.info:
+                    self.info_msg = p.info
+                if p.finished:
+                    self.out_path = p.out_path
+                    self.export_done = True
+                i += 1
+                if i % 20 == 0:
                     yield
-                    for raw, flags in fetch_messages_with_flags(conn, folder):
-                        msg = email_lib.message_from_bytes(raw)
-                        # Embed metadata for lossless re-import (see imap_utils).
-                        msg[META_FOLDER] = folder
-                        msg[META_FLAGS] = " ".join(flags)
-                        mm = mailbox_lib.mboxMessage(msg)
-                        # Mirror common IMAP flags as standard mbox status flags so
-                        # Thunderbird/Apple Mail show read/flagged/answered correctly.
-                        # (Do NOT map \Draft/\Deleted to 'D' — 'D' means *deleted* in mbox.)
-                        if r"\Seen" in flags:
-                            mm.add_flag("R")
-                        if r"\Flagged" in flags:
-                            mm.add_flag("F")
-                        if r"\Answered" in flags:
-                            mm.add_flag("A")
-                        mbox.add(mm)
-                        count += 1
-                        self.progress = count
-                        if count % 20 == 0:
-                            yield
-                            await asyncio.sleep(0)
-
-                mbox.flush()
-                mbox.close()
-
-            else:  # eml_zip
-                file_path = out_path / f"mailbox_{ts}.zip"
-                with zipfile.ZipFile(str(file_path), "w", zipfile.ZIP_DEFLATED) as zf:
-                    for folder in selected:
-                        self.info_msg = f"Exporting folder: {folder}"
-                        yield
-                        safe_name = folder.replace("/", "_").replace("\\", "_").strip('"')
-                        for i, (raw, flags) in enumerate(fetch_messages_with_flags(conn, folder)):
-                            # Prepend metadata headers (CRLF) for lossless re-import.
-                            meta = (
-                                f"{META_FOLDER}: {folder}\r\n"
-                                f"{META_FLAGS}: {' '.join(flags)}\r\n"
-                            ).encode("utf-8", "replace")
-                            zf.writestr(f"{safe_name}/{i + 1:06d}.eml", meta + raw)
-                            count += 1
-                            self.progress = count
-                            if count % 20 == 0:
-                                yield
-                                await asyncio.sleep(0)
-
-            conn.logout()
-            self.out_path = str(file_path)
-            self.export_done = True
-            self.info_msg = f"Done — {count} messages exported."
+                    await asyncio.sleep(0)
 
         except Exception as exc:
             self.err_msg = f"Export failed: {exc}"
@@ -733,6 +667,27 @@ def help_page() -> rx.Component:
                 ),
             ),
 
+            # Command line
+            help_section(
+                "Command line (no browser)",
+                rx.text(
+                    "The same export/import runs headlessly — handy for scripting and large migrations:",
+                    size="2", margin_bottom="0.5rem",
+                ),
+                rx.code_block(
+                    "# export all folders into ~/mail_export\n"
+                    'python -m mailexport export --provider "INWX / webspace.bz" --env --out ~/mail_export\n\n'
+                    "# import an mbox/zip into a mailbox (folders + flags restored)\n"
+                    "python -m mailexport import --host mail.webspace.bz --env --file ~/mail_export/mailbox.mbox",
+                    language="bash",
+                ),
+                rx.text(
+                    "Credentials come from --user/--password or --env (USER_MAIL / USER_PASSWORD). "
+                    "Run 'python -m mailexport import --help' for all options.",
+                    size="2", color_scheme="gray", margin_top="0.5rem",
+                ),
+            ),
+
             # Troubleshooting
             help_section(
                 "Troubleshooting",
@@ -759,9 +714,12 @@ def help_page() -> rx.Component:
                     "└── mailexport/\n"
                     "    ├── __init__.py\n"
                     "    ├── imap_utils.py    # IMAP helpers (connect, list, fetch, append)\n"
+                    "    ├── core.py          # Shared export/import logic (UI + CLI)\n"
                     "    ├── ui_common.py     # Shared UI primitives + provider presets\n"
                     "    ├── mailimport.py    # Import page: ImportState + UI\n"
-                    "    └── mailexport.py    # Export page: State + UI, app entry point",
+                    "    ├── mailexport.py    # Export page: State + UI, app entry point\n"
+                    "    ├── cli.py           # Headless CLI (python -m mailexport)\n"
+                    "    └── __main__.py      # CLI entry point",
                 ),
             ),
 

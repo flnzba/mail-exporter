@@ -101,6 +101,26 @@ import cap never applies. Multi-GB archives work fine.
 
 ---
 
+## Command-line interface (headless)
+
+Everything the web UI does is also available without a browser — for scripting and
+large migrations. The UI and CLI share the same core, so behaviour is identical.
+
+```bash
+# Export all folders from a provider preset into ~/mail_export
+python -m mailexport export --provider "INWX / webspace.bz" --env --out ~/mail_export
+
+# Import an mbox/zip into a mailbox (folders + read/unread state restored)
+python -m mailexport import --host mail.webspace.bz --env --file ~/mail_export/mailbox_20250101_120000.mbox
+```
+
+Credentials come from `--user`/`--password`, or with `--env` from a `.env` file
+(`USER_MAIL` / `USER_PASSWORD`). `--host` may be given directly or via `--provider`.
+Other options: `--format {mbox,eml_zip}`, `--folders A,B`, `--dest-folder`,
+`--no-structure`, `--prefix INBOX.`, `--no-ssl`. See `python -m mailexport import --help`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |

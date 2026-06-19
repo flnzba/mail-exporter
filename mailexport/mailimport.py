@@ -22,18 +22,8 @@ from pathlib import Path
 
 import reflex as rx
 
-from .imap_utils import (
-    append_message,
-    connect_imap,
-    count_eml_zip_messages,
-    count_mbox_messages,
-    ensure_folder,
-    get_namespace_info,
-    list_folders,
-    map_folder_name,
-    read_eml_zip_messages,
-    read_mbox_messages,
-)
+from .core import detect_format, iter_import
+from .imap_utils import connect_imap, list_folders
 from .ui_common import PROVIDERS, USERNAME_HINTS, card, feedback_box, field
 
 
@@ -89,12 +79,7 @@ class ImportState(rx.State):
 
     @rx.var
     def detected_fmt(self) -> str:
-        p = self.src_path.strip().lower()
-        if p.endswith(".mbox"):
-            return "mbox"
-        if p.endswith(".zip"):
-            return "eml_zip"
-        return ""
+        return detect_format(self.src_path)
 
     @rx.var
     def fmt_known(self) -> bool:
@@ -246,79 +231,49 @@ class ImportState(rx.State):
         yield
 
         try:
-            conn = connect_imap(
-                self.host.strip(),
-                int(self.port or "993"),
-                self.username.strip(),
-                self.password,
-                self.ssl,
-            )
-
-            self.info_msg = "Counting messages in source file…"
-            yield
-
-            # Detect the destination namespace so folders land where the server
-            # expects them (e.g. Froxlor/Dovecot nests everything under "INBOX.").
-            ns_prefix, sep = get_namespace_info(conn)
-            prefix = self.folder_prefix.strip() or ns_prefix
-            default_folder = self.dest_folder.strip() or "INBOX"
-            if prefix or sep != "/":
-                self.info_msg = f"Destination namespace: prefix '{prefix}' separator '{sep}'."
-                yield
-
-            if fmt == "mbox":
-                self.total = count_mbox_messages(path)
-                msg_iter = read_mbox_messages(path, default_folder)
-            else:
-                self.total = count_eml_zip_messages(path)
-                msg_iter = read_eml_zip_messages(
-                    path,
-                    preserve_structure=self.preserve_structure,
-                    single_folder=default_folder,
-                )
-            yield
-
-            ensured: set[str] = set()
-            first_error = ""
-            count = 0
-            for folder, flags, raw in msg_iter:
-                target = map_folder_name(folder, prefix, sep)
-                if target not in ensured:
-                    ensure_folder(conn, target)
-                    ensured.add(target)
-                    self.info_msg = f"Importing into folder: {target}"
-                    yield
-                ok, detail = append_message(conn, target, raw, flags)
-                if ok:
-                    self.imported_ok += 1
-                else:
-                    self.failed += 1
-                    if not first_error:
-                        first_error = f"{target}: {detail}"
-                count += 1
-                self.progress = count
-                if count % 20 == 0:
+            i = 0
+            summary = None
+            for p in iter_import(
+                host=self.host.strip(),
+                port=self.port,
+                username=self.username.strip(),
+                password=self.password,
+                ssl=self.ssl,
+                src_path=path,
+                fmt=fmt,
+                dest_folder=self.dest_folder.strip(),
+                preserve_structure=self.preserve_structure,
+                folder_prefix=self.folder_prefix.strip(),
+            ):
+                self.progress = p.done
+                self.total = p.total
+                self.imported_ok = p.ok
+                self.failed = p.failed
+                if p.info:
+                    self.info_msg = p.info
+                if p.finished:
+                    summary = p
+                i += 1
+                if i % 20 == 0:
                     yield
                     await asyncio.sleep(0)
 
-            conn.logout()
-            done = f"{self.imported_ok} message(s) imported"
-            if self.failed:
-                done += f", {self.failed} failed"
-
-            if self.imported_ok == 0 and self.failed > 0:
+            if summary and summary.ok == 0 and summary.failed > 0:
                 # Total failure — surface the reason, no success box.
                 self.info_msg = ""
                 self.err_msg = (
-                    f"No messages were imported. First error — {first_error}. "
+                    f"No messages were imported. First error — {summary.first_error}. "
                     "Tip: for Froxlor / Dovecot try setting the folder prefix to "
                     "'INBOX.', or import into a single existing folder."
                 )
             else:
                 self.import_done = True
-                self.info_msg = f"Done — {done}."
+                done = f"{self.imported_ok} message(s) imported"
                 if self.failed:
-                    self.err_msg = f"{self.failed} message(s) failed. First error — {first_error}."
+                    done += f", {self.failed} failed"
+                self.info_msg = f"Done — {done}."
+                if summary and summary.failed:
+                    self.err_msg = f"{self.failed} message(s) failed. First error — {summary.first_error}."
 
         except Exception as exc:
             self.err_msg = f"Import failed: {exc}"
