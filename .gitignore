@@ -6,6 +6,7 @@ assets/external/
 *.py[cod]
 venv/
 pyvenv.cfg
+.env
 
 # Reflex-generated frontend toolchain lock (regenerated on `reflex run`)
 reflex.lock/

@@ -20,45 +20,18 @@ from pathlib import Path
 import reflex as rx
 
 from .imap_utils import (
+    META_FLAGS,
+    META_FOLDER,
     connect_imap,
     count_messages_in_folder,
-    fetch_raw_messages,
+    fetch_messages_with_flags,
     list_folders,
 )
+from .mailimport import import_page
+from .ui_common import PROVIDERS, USERNAME_HINTS, card, feedback_box, field
 
-# ── Provider presets ─────────────────────────────────────────────────────────
-# (host, port-string, ssl)
-PROVIDERS: dict[str, tuple[str, str, bool]] = {
-    "easyname (Control Panel)": ("imap.easyname.com",         "993", True),
-    "easyname (CloudPit)":      ("imap.easyname.com",         "993", True),
-    "Gmail":                    ("imap.gmail.com",             "993", True),
-    "Outlook/Office365":        ("outlook.office365.com",      "993", True),
-    "Yahoo Mail":               ("imap.mail.yahoo.com",        "993", True),
-    "GMX":                      ("imap.gmx.com",               "993", True),
-    "iCloud":                   ("imap.mail.me.com",           "993", True),
-    "Fastmail":                 ("imap.fastmail.com",          "993", True),
-    "Custom":                   ("",                           "993", True),
-}
-
-# Per-provider username label / hint shown below the username field
-USERNAME_HINTS: dict[str, str] = {
-    "easyname (Control Panel)": (
-        "⚠ Use the mailbox name from your Control Panel → Datasheet "
-        "(e.g. abc123) — NOT the email address."
-    ),
-    "easyname (CloudPit)": (
-        "Use your full email address (e.g. you@yourdomain.at)."
-    ),
-    "Gmail": (
-        "Use an App Password if you have 2-Step Verification enabled."
-    ),
-    "Yahoo Mail": (
-        "Use an App Password (generated at login.yahoo.com/account/security)."
-    ),
-    "iCloud": (
-        "Use an App-Specific Password from appleid.apple.com."
-    ),
-}
+# Provider presets (PROVIDERS) and per-provider USERNAME_HINTS now live in
+# ui_common.py so the import page can reuse them.
 
 DEFAULT_OUT = str(Path.home() / "mail_export")
 
@@ -285,9 +258,22 @@ class State(rx.State):
                 for folder in selected:
                     self.info_msg = f"Exporting folder: {folder}"
                     yield
-                    for raw in fetch_raw_messages(conn, folder):
+                    for raw, flags in fetch_messages_with_flags(conn, folder):
                         msg = email_lib.message_from_bytes(raw)
-                        mbox.add(msg)
+                        # Embed metadata for lossless re-import (see imap_utils).
+                        msg[META_FOLDER] = folder
+                        msg[META_FLAGS] = " ".join(flags)
+                        mm = mailbox_lib.mboxMessage(msg)
+                        # Mirror common IMAP flags as standard mbox status flags so
+                        # Thunderbird/Apple Mail show read/flagged/answered correctly.
+                        # (Do NOT map \Draft/\Deleted to 'D' — 'D' means *deleted* in mbox.)
+                        if r"\Seen" in flags:
+                            mm.add_flag("R")
+                        if r"\Flagged" in flags:
+                            mm.add_flag("F")
+                        if r"\Answered" in flags:
+                            mm.add_flag("A")
+                        mbox.add(mm)
                         count += 1
                         self.progress = count
                         if count % 20 == 0:
@@ -304,8 +290,13 @@ class State(rx.State):
                         self.info_msg = f"Exporting folder: {folder}"
                         yield
                         safe_name = folder.replace("/", "_").replace("\\", "_").strip('"')
-                        for i, raw in enumerate(fetch_raw_messages(conn, folder)):
-                            zf.writestr(f"{safe_name}/{i + 1:06d}.eml", raw)
+                        for i, (raw, flags) in enumerate(fetch_messages_with_flags(conn, folder)):
+                            # Prepend metadata headers (CRLF) for lossless re-import.
+                            meta = (
+                                f"{META_FOLDER}: {folder}\r\n"
+                                f"{META_FLAGS}: {' '.join(flags)}\r\n"
+                            ).encode("utf-8", "replace")
+                            zf.writestr(f"{safe_name}/{i + 1:06d}.eml", meta + raw)
                             count += 1
                             self.progress = count
                             if count % 20 == 0:
@@ -326,68 +317,7 @@ class State(rx.State):
 
 
 # ── Shared UI primitives ──────────────────────────────────────────────────────
-
-def feedback_box(text, color) -> rx.Component:
-    # `color` may be a literal ("red") or a reflex Var (rx.cond(...)), so resolve
-    # the palette with rx.match instead of indexing a plain dict at compile time.
-    bg = rx.match(
-        color,
-        ("green", "#f0fdf4"),
-        ("red", "#fef2f2"),
-        ("orange", "#fff7ed"),
-        "#eff6ff",  # blue / default
-    )
-    fg = rx.match(
-        color,
-        ("green", "#166534"),
-        ("red", "#991b1b"),
-        ("orange", "#9a3412"),
-        "#1e40af",
-    )
-    border_color = rx.match(
-        color,
-        ("green", "#86efac"),
-        ("red", "#fca5a5"),
-        ("orange", "#fdba74"),
-        "#93c5fd",
-    )
-    return rx.box(
-        rx.text(text, size="2", color=fg),
-        background=bg,
-        border_width="1px",
-        border_style="solid",
-        border_color=border_color,
-        border_radius="0.375rem",
-        padding="0.5rem 0.875rem",
-        width="100%",
-        margin_top="0.5rem",
-    )
-
-
-def card(title: str, *children) -> rx.Component:
-    return rx.box(
-        rx.heading(title, size="4", margin_bottom="0.6rem", color_scheme="blue"),
-        rx.divider(margin_bottom="0.75rem"),
-        *children,
-        padding="1.25rem",
-        border_radius="0.5rem",
-        border="1px solid var(--gray-5)",
-        background="var(--gray-1)",
-        width="100%",
-        margin_bottom="1rem",
-        box_shadow="0 1px 3px rgba(0,0,0,.08)",
-    )
-
-
-def field(label: str, control: rx.Component, note: str = "") -> rx.Component:
-    children = [
-        rx.text(label, size="1", weight="medium", color_scheme="gray", margin_bottom="0.2rem"),
-        control,
-    ]
-    if note:
-        children.append(rx.text(note, size="1", color_scheme="gray", margin_top="0.2rem"))
-    return rx.box(*children, margin_bottom="0.75rem", width="100%")
-
+# feedback_box / card / field now live in ui_common.py (shared with the import page).
 
 def folder_row(item: FolderItem, idx: int) -> rx.Component:
     return rx.flex(
@@ -422,11 +352,15 @@ def index() -> rx.Component:
                 ),
                 rx.spacer(),
                 rx.link(
+                    rx.button("📥 Import", size="1", variant="soft", color_scheme="blue"),
+                    href="/import",
+                ),
+                rx.link(
                     rx.button("? Help", size="1", variant="soft", color_scheme="gray"),
                     href="/help",
                 ),
-                gap="3", align="center", margin_bottom="1.5rem", padding_top="1rem",
-                width="100%",
+                gap="2", align="center", margin_bottom="1.5rem", padding_top="1rem",
+                width="100%", flex_wrap="wrap",
             ),
 
             # ── Step 1 · Connection ───────────────────────────────────────
@@ -583,6 +517,12 @@ def index() -> rx.Component:
                             "EML/ZIP — one .eml file per message inside a ZIP archive.",
                             "blue",
                         ),
+                    ),
+
+                    feedback_box(
+                        "Exports embed folder + flag metadata so they re-import losslessly "
+                        "on the Import page (📥) — folder structure and read/unread state preserved.",
+                        "blue",
                     ),
 
                     rx.box(height="0.75rem"),
@@ -767,6 +707,32 @@ def help_page() -> rx.Component:
                 ),
             ),
 
+            # Importing
+            help_section(
+                "Importing into a mailbox",
+                rx.text(
+                    "The Import page (📥 top-right, or /import) pushes a previously-exported "
+                    ".mbox or .zip back into any IMAP mailbox. You give it a local file path — "
+                    "the file is read straight from disk and messages are delivered via IMAP "
+                    "APPEND, so there is no browser upload and the ~50 MB webmail / control-panel "
+                    "(e.g. Froxlor) import cap never applies.",
+                    size="2", margin_bottom="0.75rem",
+                ),
+                rx.box(
+                    help_row("How to start", "Connect to the destination account, enter the path to the .mbox/.zip, set options, then Import."),
+                    help_row("Folders & flags", "Files exported by this app embed folder + flag metadata, so folder structure and read/unread state are restored exactly."),
+                    help_row("MBOX", "All messages go into one destination folder (an mbox carries no folder structure of its own)."),
+                    help_row("EML/ZIP", "One destination folder per archive sub-folder by default; toggle off to import everything into a single folder."),
+                    help_row("Folder prefix", "Optional — some servers require all folders under a namespace such as 'INBOX.'."),
+                    help_row("⚠ No de-duplication", "IMAP APPEND always adds; running an import twice creates duplicate copies. Import into a fresh folder when unsure."),
+                    help_row("Plain / 3rd-party files", "Files without this app's metadata still import: mbox → destination folder, zip → one folder per sub-folder; flags are not restored."),
+                    padding="1rem",
+                    background="var(--gray-2)",
+                    border_radius="0.375rem",
+                    border="1px solid var(--gray-4)",
+                ),
+            ),
+
             # Troubleshooting
             help_section(
                 "Troubleshooting",
@@ -792,8 +758,10 @@ def help_page() -> rx.Component:
                     "├── README.md            # This manual as plain Markdown\n"
                     "└── mailexport/\n"
                     "    ├── __init__.py\n"
-                    "    ├── imap_utils.py    # IMAP helpers (connect, list, fetch)\n"
-                    "    └── mailexport.py    # Reflex state + UI (single file)",
+                    "    ├── imap_utils.py    # IMAP helpers (connect, list, fetch, append)\n"
+                    "    ├── ui_common.py     # Shared UI primitives + provider presets\n"
+                    "    ├── mailimport.py    # Import page: ImportState + UI\n"
+                    "    └── mailexport.py    # Export page: State + UI, app entry point",
                 ),
             ),
 
@@ -815,3 +783,4 @@ def help_page() -> rx.Component:
 app = rx.App()
 app.add_page(index, route="/",     title="Mail Exporter")
 app.add_page(help_page, route="/help", title="Mail Exporter — Manual")
+app.add_page(import_page, route="/import", title="Mail Importer")
